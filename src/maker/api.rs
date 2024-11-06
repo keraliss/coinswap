@@ -204,7 +204,7 @@ impl Maker {
             config.connection_type = connection_type;
         }
 
-        // TODO: Write the modified config back to the file.
+        config.write_to_file(&data_dir.join("config.toml"))?;
 
         log::info!("Initializing wallet sync");
         wallet.sync()?;
@@ -734,7 +734,7 @@ pub fn recover_from_swap(
         let block_lookup_interval = if cfg!(feature = "integration-test") {
             Duration::from_secs(10)
         } else {
-            Duration::from_secs(10 * 60)
+            Duration::from_secs(300)
         };
         std::thread::sleep(block_lookup_interval);
     }
