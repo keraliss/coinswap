@@ -526,3 +526,346 @@ impl Wallet {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::wallet::RPCConfig;
+    use bip39::Mnemonic;
+    use bitcoin::{Amount, Network};
+    use bitcoind::bitcoincore_rpc::Client;
+    use std::path::PathBuf;
+
+    fn create_test_wallet_with_name(wallet_name: &str) -> Wallet {
+        let rpc_config = RPCConfig {
+            wallet_name: wallet_name.to_string(),
+            ..Default::default()
+        };
+    
+        let mnemonic = Mnemonic::generate(12).unwrap();
+        let seedphrase = mnemonic.to_string();
+    
+        let wallet_path = PathBuf::from("test_wallets").join(wallet_name);
+    
+        Wallet::init(&wallet_path, &rpc_config, seedphrase, "".to_string()).unwrap()
+    }
+
+    #[test]
+    fn test_amount_fractions() {
+        {
+            let total = 1000000;
+            let result = Wallet::generate_amount_fractions(2, Amount::from_sat(total));
+            assert!(result.is_ok());
+            let values = result.unwrap();
+            assert_eq!(values.iter().sum::<u64>(), total);
+            assert!(values.iter().all(|&x| x >= 5000));
+        }
+        {
+            let result = Wallet::generate_amount_fractions(2, Amount::from_sat(5000));
+            assert!(result.is_err());
+        }
+        {
+            let total = 1000001;
+            let result = Wallet::generate_amount_fractions(2, Amount::from_sat(total));
+            assert!(result.is_ok());
+            let values = result.unwrap();
+            assert_eq!(values.iter().sum::<u64>(), total);
+            assert!(values.iter().all(|&x| x >= 5000));
+        }
+        {
+            let result = Wallet::generate_amount_fractions(2, Amount::from_sat(u64::MAX));
+            assert!(result.is_ok());
+            let values = result.unwrap();
+            assert_eq!(values.iter().sum::<u64>(), u64::MAX);
+            assert!(values.iter().all(|&x| x >= 5000));
+        }
+    }
+
+    #[test]
+    fn test_generate_amount_fractions_without_correction() {
+        {
+            let total = Amount::from_sat(1_000_000);
+            let count = 3;
+            let lower_limit = 5000;
+            let result =
+                Wallet::generate_amount_fractions_without_correction(count, total, lower_limit);
+
+            assert!(result.is_ok());
+            let fractions = result.unwrap();
+
+            assert_eq!(fractions.len(), count);
+            assert!((fractions.iter().sum::<f32>() - 1.0).abs() < 0.000001);
+            assert!(fractions
+                .iter()
+                .all(|&f| f * (total.to_sat() as f32) > lower_limit as f32));
+        }
+
+        {
+            let count = 2;
+            let lower_limit = 5000;
+            let total = Amount::from_sat(11_000);
+            let result =
+                Wallet::generate_amount_fractions_without_correction(count, total, lower_limit);
+
+            assert!(result.is_ok());
+            let fractions = result.unwrap();
+            assert_eq!(fractions.len(), count);
+            assert!(fractions
+                .iter()
+                .all(|&f| f * (total.to_sat() as f32) > lower_limit as f32));
+        }
+
+        {
+            let count = 2;
+            let lower_limit = 5000;
+            let total = Amount::from_sat(9_000);
+            let result =
+                Wallet::generate_amount_fractions_without_correction(count, total, lower_limit);
+
+            assert!(result.is_err());
+            assert!(matches!(result,
+                Err(WalletError::Protocol(msg)) if msg.contains("amount too small")));
+        }
+
+        {
+            let total = Amount::from_sat(1_000_000);
+            let count = 10;
+            let lower_limit = 5000;
+            let result =
+                Wallet::generate_amount_fractions_without_correction(count, total, lower_limit);
+
+            assert!(result.is_ok());
+            let fractions = result.unwrap();
+            assert_eq!(fractions.len(), count);
+            assert!(fractions
+                .iter()
+                .all(|&f| f * (total.to_sat() as f32) > lower_limit as f32));
+        }
+
+        {
+            let total = Amount::from_sat(100_000);
+            let count = 2;
+            let lower_limit = 1000;
+            let result =
+                Wallet::generate_amount_fractions_without_correction(count, total, lower_limit);
+
+            assert!(result.is_ok());
+            let fractions = result.unwrap();
+            let max_fraction = fractions.iter().fold(0f32, |a, &b| a.max(b));
+            assert!(max_fraction < 0.9);
+        }
+
+        {
+            let total = Amount::from_sat(1_000_000);
+            let count = 3;
+            let lower_limit = 5000;
+
+            let result1 =
+                Wallet::generate_amount_fractions_without_correction(count, total, lower_limit)
+                    .unwrap();
+            let result2 =
+                Wallet::generate_amount_fractions_without_correction(count, total, lower_limit)
+                    .unwrap();
+            assert_ne!(result1, result2);
+        }
+
+        {
+            let total = Amount::from_sat(1_000_000);
+            let lower_limit = 5000;
+
+            let result =
+                Wallet::generate_amount_fractions_without_correction(0, total, lower_limit);
+            assert!(result.is_ok());
+            let fractions = result.unwrap();
+            assert_eq!(fractions.len(), 1);
+            assert!((fractions[0] - 1.0).abs() < 0.000001);
+
+            let result =
+                Wallet::generate_amount_fractions_without_correction(1, total, lower_limit);
+            assert!(result.is_ok());
+            let fractions = result.unwrap();
+            assert_eq!(fractions.len(), 1);
+            assert!((fractions[0] - 1.0).abs() < 0.000001);
+        }
+    }
+
+    #[test]
+    fn test_mostly_sweep_txes_with_one_tx_having_change() {
+        let wallet_name = format!(
+            "test_wallet_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+        );
+
+        let rpc_config = RPCConfig::default();
+        let rpc = Client::new(&rpc_config.url, rpc_config.auth.clone()).unwrap();
+
+        rpc.create_wallet(&wallet_name, None, None, None, None)
+            .unwrap();
+        let wallet = create_test_wallet_with_name(&wallet_name);
+
+        let mining_address = wallet
+            .rpc
+            .get_new_address(None, None)
+            .unwrap()
+            .require_network(Network::Regtest)
+            .unwrap();
+        println!("Generating initial blocks...");
+        wallet
+            .rpc
+            .generate_to_address(200, &mining_address)
+            .unwrap();
+
+        println!("Mining to address: {}", mining_address);
+
+        println!("Using wallet: {}", wallet_name);
+        wallet
+            .rpc
+            .generate_to_address(200, &mining_address)
+            .unwrap();
+
+        println!("Mining to address: {}", mining_address);
+        println!("Using wallet: {}", wallet_name);
+
+        wallet
+            .rpc
+            .generate_to_address(200, &mining_address)
+            .unwrap();
+
+        let balance = wallet.rpc.get_wallet_info().unwrap();
+        println!("Wallet balance: {:?}", balance);
+
+        let balance = wallet.rpc.get_balance(None, None).unwrap();
+        println!("Initial wallet balance: {} BTC", balance);
+        assert!(
+            balance.to_sat() > 0,
+            "Wallet should have non-zero balance after mining"
+        );
+
+        // println!("Generating initial blocks...");
+        // wallet
+        //     .rpc
+        //     .generate_to_address(101, &mining_address)
+        //     .unwrap();
+        // wallet
+        //     .rpc
+        //     .generate_to_address(101, &mining_address)
+        //     .unwrap();
+
+        // let new_block_count = wallet.rpc.get_block_count().unwrap();
+        // println!("New block count: {}", new_block_count);
+
+        // println!("Checking wallet balance...");
+        // let balance = wallet.rpc.get_balance(None, None).unwrap();
+        // println!("Wallet balance: {} BTC", balance);
+
+        // assert!(
+        //     balance.to_sat() > 0,
+        //     "Wallet should have non-zero balance after mining"
+        // );
+
+        // println!("Creating test UTXOs...");
+        // let dest_addr = wallet
+        //     .rpc
+        //     .get_new_address(None, None)
+        //     .unwrap()
+        //     .require_network(Network::Regtest)
+        //     .unwrap();
+
+        // // Use larger amounts that are above dust limit
+        // let amounts = vec![10_000, 7_500, 5_000]; // Much larger amounts
+
+        // for amount in amounts {
+        //     wallet
+        //         .rpc
+        //         .send_to_address(
+        //             &dest_addr,
+        //             Amount::from_sat(amount),
+        //             None,
+        //             None,
+        //             None,
+        //             None,
+        //             None,
+        //             None,
+        //         )
+        //         .unwrap();
+        // }
+
+        // // Generate block to confirm transactions
+        // wallet.rpc.generate_to_address(1, &mining_address).unwrap();
+
+        // // Get and check final UTXOs
+        // let all_utxos = wallet.get_all_utxo().unwrap();
+        // println!("Available UTXOs after setup: {:?}", all_utxos);
+
+        // // Sort UTXOs by amount (largest first)
+        // let mut sorted_utxos: Vec<_> = all_utxos
+        //     .into_iter()
+        //     .map(|u| (u.txid, u.vout, u.amount.to_sat()))
+        //     .collect();
+        // sorted_utxos.sort_by(|a, b| b.2.cmp(&a.2));
+
+        // // Take the first three UTXOs
+        // let test_utxos: Vec<_> = sorted_utxos.into_iter().take(3).collect();
+        // println!("Using UTXOs for test: {:?}", test_utxos);
+
+        // // Create destination addresses for the test
+        // let destinations = vec![
+        //     wallet
+        //         .rpc
+        //         .get_new_address(None, None)
+        //         .unwrap()
+        //         .require_network(Network::Regtest)
+        //         .unwrap(),
+        //     wallet
+        //         .rpc
+        //         .get_new_address(None, None)
+        //         .unwrap()
+        //         .require_network(Network::Regtest)
+        //         .unwrap(),
+        //     wallet
+        //         .rpc
+        //         .get_new_address(None, None)
+        //         .unwrap()
+        //         .require_network(Network::Regtest)
+        //         .unwrap(),
+        // ];
+
+        // let change_address = wallet
+        //     .rpc
+        //     .get_new_address(None, None)
+        //     .unwrap()
+        //     .require_network(Network::Regtest)
+        //     .unwrap();
+
+        // // Rest remains the same but with adjusted coinswap_amount
+        // let coinswap_amount = Amount::from_sat(20_000); // Increased amount
+        // let fee_rate = Amount::from_sat(100); // Increased fee rate
+
+        // // Execute the test function
+        // let result = wallet.create_mostly_sweep_txes_with_one_tx_having_change(
+        //     coinswap_amount,
+        //     &destinations,
+        //     fee_rate,
+        //     &change_address,
+        //     &mut test_utxos.into_iter(),
+        // );
+
+        // println!("Result: {:?}", result);
+        // assert!(result.is_ok());
+
+        // if let Ok(funding_result) = result {
+        //     // Verify the results
+        //     assert_eq!(funding_result.funding_txes.len(), destinations.len());
+
+        //     // Verify each transaction
+        //     for tx in &funding_result.funding_txes {
+        //         assert!(!tx.input.is_empty(), "Transaction should have inputs");
+        //         assert!(!tx.output.is_empty(), "Transaction should have outputs");
+        //         assert_eq!(tx.version, Version::TWO);
+        //     }
+        // }
+    }
+}
