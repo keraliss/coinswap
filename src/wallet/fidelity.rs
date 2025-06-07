@@ -127,8 +127,6 @@ pub struct FidelityBond {
     pub(crate) conf_height: Option<u32>,
     // Cert expiry denoted in multiple of difficulty adjustment period (2016 blocks)
     pub(crate) cert_expiry: Option<u32>,
-    // Txid of Transaction which redeemed the bond
-    pub redeem_tx: Option<Txid>,
 }
 
 impl FidelityBond {
@@ -168,7 +166,7 @@ impl FidelityBond {
 // Wallet APIs related to fidelity bonds.
 impl Wallet {
     /// Get a reference to the fidelity bond store
-    pub fn get_fidelity_bonds(&self) -> &HashMap<u32, FidelityBond> {
+    pub fn get_fidelity_bonds(&self) -> &HashMap<u32, (FidelityBond, bool)> {
         &self.store.fidelity_bond
     }
 
@@ -178,13 +176,12 @@ impl Wallet {
             .store
             .fidelity_bond
             .iter()
-            .map(|(index, bond)| {
-                let redeemed = bond.redeem_tx.is_some();
+            .map(|(index, (bond, redeemed))| {
                 let mut bond_info = serde_json::json!({
                         "index": index,
                         "outpoint": bond.outpoint.to_string(),
                         "amount": bond.amount.to_sat(),
-                        "status": if redeemed {"Redeemed"} else {"Live"}
+                "status": if *redeemed {"Redeemed"} else {"Live"}
                 });
 
                 if !redeemed {
@@ -207,8 +204,7 @@ impl Wallet {
             .store
             .fidelity_bond
             .iter()
-            .filter_map(|(i, bond)| {
-                let expired = bond.redeem_tx.is_some();
+            .filter_map(|(i, (bond, expired))| {
                 if !expired {
                     match self.calculate_bond_value(bond) {
                         Ok(v) => {
@@ -250,7 +246,7 @@ impl Wallet {
             .fidelity_bond
             .get(&index)
             .ok_or(FidelityError::BondDoesNotExist)?;
-        Ok(bond.redeem_script())
+        Ok(bond.0.redeem_script())
     }
 
     /// Get the next fidelity bond address. If no fidelity bond is created
@@ -356,9 +352,8 @@ impl Wallet {
                 // `Conf_height` & `cert_expiry` are considered None as they can't be known before the confirmation.
                 conf_height: None,
                 cert_expiry: None,
-                redeem_tx: None,
             };
-            self.store.fidelity_bond.insert(index, bond);
+            self.store.fidelity_bond.insert(index, (bond, false));
             self.save_to_disk()?;
         }
 
@@ -411,8 +406,8 @@ impl Wallet {
             .get_mut(&index)
             .ok_or(FidelityError::BondDoesNotExist)?;
 
-        bond.cert_expiry = Some(cert_expiry);
-        bond.conf_height = Some(conf_height);
+        bond.0.cert_expiry = Some(cert_expiry);
+        bond.0.conf_height = Some(conf_height);
 
         self.sync()?;
 
@@ -427,8 +422,7 @@ impl Wallet {
             .store
             .fidelity_bond
             .iter()
-            .filter_map(|(&i, bond)| {
-                let redeemed = bond.redeem_tx.is_some();
+            .filter_map(|(&i, (bond, redeemed))| {
                 if !redeemed && curr_height > bond.lock_time.to_consensus_u32() {
                     Some(i)
                 } else {
@@ -450,13 +444,12 @@ impl Wallet {
         maker_addr: &str,
     ) -> Result<FidelityProof, WalletError> {
         // Generate a fidelity bond proof from the fidelity data.
-        let bond = self
+        let (bond, redeemed) = self
             .store
             .fidelity_bond
             .get(&index)
             .ok_or(FidelityError::BondDoesNotExist)?;
-        let redeemed = bond.redeem_tx.is_some();
-        if redeemed {
+        if *redeemed {
             return Err(FidelityError::BondAlreadyRedeemed.into());
         }
 
